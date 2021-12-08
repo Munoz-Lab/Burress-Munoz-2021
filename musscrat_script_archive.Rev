@@ -1,0 +1,239 @@
+################################################################################
+#
+# RevBayes: Bayesian inference of rates of evolution under a
+#                   state-dependent Brownian-motion model (MuSSCRat)
+#
+# This script performs the full implementation of MuSSCRat (May and Moore 2020.
+# Syst. Biol.) that includes extensions for multivariate characters and
+# hypothesis testing. Consult the RevBayes tutorials for help building versions
+# with different combinations of extensions.
+#
+# RevBayes tutorial for MuSSCRat
+# https://revbayes.github.io/tutorials/cont_traits/state_dependent_bm.html
+#
+# base script author: Michael R. May
+# script modified by: Edward D. Burress
+#
+################################################################################
+
+####################
+# Read in the Data #
+####################
+
+
+### Read in the tree
+T <- readTrees("data/anole_165tip.tre")[1]
+ntips <- T.ntips()
+nbranches <- 2 * ntips - 2
+
+### Read in the continuous-character data
+cont <- readContinuousCharacterData("data/anole_continuous_character_165tip.nex")
+nchar <- cont.nchar()
+
+### Read in the discrete-character data
+disc <- readDiscreteCharacterData("data/anole_discrete_character.nex")
+num_disc_states <- disc.getStateDescriptions().size()
+
+# Create some vector for the moves and monitors of this analysis
+moves    = VectorMoves()
+monitors = VectorMonitors()
+
+##########################
+# Specify the tree model #
+##########################
+
+tree <- T
+
+########################################
+# Specify the discrete-character model #
+########################################
+
+# make the Q matrix
+Q <- fnJC(num_disc_states)
+
+# make the transition rate parameter
+lambda ~ dnLoguniform(1e-3, 1)
+moves.append( mvScale(lambda, weight=1.0) )
+
+# make the data-augmented CTCM model
+X ~ dnPhyloCTMCDASiteIID(tree, Q, branchRates=lambda, type="Standard", nSites=1)
+X.clamp(disc)
+
+# include proposals for the discrete character history
+moves.append( mvCharacterHistory(ctmc=X, qmap_site=Q, graph="node",   proposal="rejection", weight=20.0) )
+moves.append( mvCharacterHistory(ctmc=X, qmap_site=Q, graph="branch", proposal="rejection", weight=20.0) )
+
+# keep track of the number of transitions
+for(i in 1:nbranches) {
+    num_changes[i] := sum(X.numCharacterChanges(i))
+}
+total_num_changes := sum(num_changes)
+
+
+
+########################################################################################################
+#specify the correlation matrix and build the variance-covariance matrix for the continuous characters #
+########################################################################################################
+
+#specify the proportional rates
+alpha <- 1.0
+proportional_rates ~ dnDirichlet( rep(alpha, nchar) )
+relative_rates := proportional_rates * nchar
+moves.append( mvBetaSimplex(proportional_rates, weight=2.0) )
+
+#specify an LKJ prior on correlation matrix
+eta <- 1.0
+P ~ dnLKJPartial( eta, nchar )
+
+moves.append( mvCorrelationMatrixRandomWalk(P, weight=3.0) )
+moves.append( mvCorrelationMatrixSingleElementBeta(P, weight=5.0) )
+
+R := fnPartialToCorr(P)
+
+correlations := R.upperTriangle()
+
+#construct variance-covariance matrix
+V := fnDecompVarCovar( relative_rates^0.5, R )
+
+
+
+
+########################################################
+# Specify the rate model for the continuous characters #
+########################################################
+
+#note that the prior on the expected number of rate shifts is USER SPECIFIED
+
+# specify the average rate
+beta_root ~ dnLoguniform(1e-3, 1)
+moves.append( mvScale(beta_root, weight=1.0) )
+
+# specify the prior on the number of rate shifts
+expected_number_of_shifts <- 50
+rate_shift_probability    <- expected_number_of_shifts / nbranches
+
+# specify the prior on the magnitude of rate shifts
+sd = 0.578
+rate_shift_distribution = dnLognormal(-sd^2/2, sd)
+
+# specify the branch-specific rates
+for(i in nbranches:1) {
+
+    # draw the rate multiplier from a mixture distribution
+    branch_rate_multiplier[i] ~ dnReversibleJumpMixture(1, rate_shift_distribution, Probability(1 - rate_shift_probability) )
+
+    # compute the rate for the branch
+    if ( tree.isRoot( tree.parent(i) ) ) {
+       background_rates[i] := beta_root * branch_rate_multiplier[i]
+    } else {
+       background_rates[i] := background_rates[tree.parent(i)] * branch_rate_multiplier[i]
+    }
+
+    # keep track of whether the branch has a rate shift
+    branch_rate_shift[i] := ifelse( branch_rate_multiplier[i] == 1, 0, 1 )
+
+    # use reversible-jump to move between models with and without
+    # shifts on the branch
+    moves.append( mvRJSwitch(branch_rate_multiplier[i], weight=10) )
+
+    # include proposals on the rate mutliplier (when it is not 1)
+    moves.append( mvScale(branch_rate_multiplier[i], weight=10) )
+
+}
+
+# keep track of the number of rate shifts
+num_rate_changes := sum( branch_rate_shift )
+
+
+
+####################################################################################################################################
+# specify the relative state-dependent rates (with sum 1) and calculate posterior probability that these rates are state-dependent #
+####################################################################################################################################
+
+concentration <- 1.0
+proportional_zeta ~ dnReversibleJumpMixture( simplex(rep(1,num_disc_states)), dnDirichlet( rep(concentration, num_disc_states) ), p=0.5 )
+moves.append( mvRJSwitch(proportional_zeta, weight=10.0) )
+moves.append( mvBetaSimplex(proportional_zeta, weight=1.0) )
+is_state_dependent := ifelse( proportional_zeta == simplex(rep(1,num_disc_states)), 0.0, 1.0)
+
+
+
+##############################################################
+# compute the state dependent rates and overall branch rates #
+##############################################################
+
+# compute the state dependent rates (with mean 1)
+zeta := proportional_zeta * num_disc_states
+
+# compute the state-dependent branch rates
+for(i in 1:nbranches) {
+    state_branch_rate[i] := sum(X.relativeTimeInStates(i,1) * abs(zeta))
+}
+
+# compute the overall branch rates (including the background rates)
+branch_rates := state_branch_rate * background_rates
+
+
+
+
+##########################
+# Specify the BM process #
+##########################
+
+Y ~ dnPhyloMultivariateBrownianREML(tree, branchRates=branch_rates^0.5, rateMatrix=V)
+Y.clamp(cont)
+
+
+
+#############
+# The Model #
+#############
+
+mymodel = model(zeta)
+
+### set up the monitors that will output parameter values to file and screen
+monitors.append( mnModel(filename="output/relaxed_state_dependent_BM.log", printgen=10) )
+monitors.append( mnScreen(printgen=1000, zeta, num_rate_changes, total_num_changes) )
+
+
+
+###############################################################################
+# add monitors for the state branch rates, background rates, and branch rates #
+###############################################################################
+
+monitors.append( mnExtNewick(filename="output/state_branch_rates.trees", tree, state_branch_rate, printgen=10, isNodeParameter=true))
+monitors.append( mnExtNewick(filename="output/branch_rates.trees", tree, branch_rates, printgen=10, isNodeParameter=true))
+monitors.append( mnExtNewick(filename="output/background_rates.trees", tree, background_rates, printgen=10, isNodeParameter=true))
+
+
+
+################
+# The Analysis #
+################
+
+### workspace mcmc ###
+mymcmc = mcmc(mymodel, monitors, moves, nruns=1, combine="mixed")
+
+
+### run the MCMC ###
+mymcmc.burnin(generations=10000, tuningInterval=100)
+mymcmc.run(generations=100000)
+
+
+
+##################################################################################################
+# summarize state branch rates, background rates, and branch rates as maximum a posteriori trees #
+##################################################################################################
+
+treetrace=readTreeTrace("output/state_branch_rates.trees",treetype="clock")
+map_tree=mapTree(treetrace,"output/state_branch_rates_tree.tre")
+
+treetrace=readTreeTrace("output/branch_rates.trees",treetype="clock")
+map_tree=mapTree(treetrace,"output/branch_rates_tree.tre")
+
+treetrace=readTreeTrace("output/background_rates.trees",treetype="clock")
+map_tree=mapTree(treetrace,"output/background_rates_tree.tre")
+
+
+## quit ##
+#q()
