@@ -27,3 +27,12 @@ head length (dhl), toe length (tol), tail length (tal), and number of
 lamellae (lam). All continuous characters are ln-transformed.
 
 The first column of the file contains species names.
+
+
+The accompanying Rev file includes the script used for the main analyses in 
+the paper (MuSSCrat with a random local clock model, an extension for 
+multivariate characters, and an extension for hypothesis testing. The 
+RevBayes tutorial for this analysis can be found at the following
+webpage:
+
+https://revbayes.github.io/tutorials/cont_traits/state_dependent_bm.html
